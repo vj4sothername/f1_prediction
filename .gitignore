@@ -365,6 +365,6 @@ FodyWeavers.xsd
 #kaggle
 kaggle.json
 
-F1 Data/
+data/
 
 f1.docx

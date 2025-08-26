@@ -15,13 +15,30 @@ from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay, PrecisionRe
 
 data_path = os.path.dirname(os.path.abspath(__file__))
 
-# Load all CSVs in the folder
-csv_files = [f for f in os.listdir(data_path) if f.endswith('.csv')]
-dfs = {os.path.splitext(f)[0]: pd.read_csv(os.path.join(data_path, f)) for f in csv_files}
+# Resolve data directory (env var > ./data > script folder)
+data_root_candidates = [
+    os.environ.get("F1_DATA_DIR"),
+    os.path.join(data_path, "data"),
+    data_path,
+]
+data_root = next((d for d in data_root_candidates if d and os.path.isdir(d)), data_path)
 
-# Replace '\\N' with np.nan in all DataFrames before merging
-for name, df in dfs.items():
-    dfs[name] = df.replace('\\N', np.nan)
+# Load all CSVs from the chosen data directory (case-insensitive keys)
+csv_files = [f for f in os.listdir(data_root) if f.lower().endswith('.csv')]
+if not csv_files:
+    raise FileNotFoundError(
+        f"No CSV files found in '{data_root}'. Place your Ergast CSVs (e.g., results.csv, races.csv) there "
+        f"or set F1_DATA_DIR to the directory containing them."
+    )
+dfs = {os.path.splitext(f)[0].lower(): pd.read_csv(os.path.join(data_root, f)) for f in csv_files}
+print("Loaded CSVs:", sorted(dfs.keys()))
+
+if 'results' not in dfs:
+    raise KeyError(
+        "Could not find 'results.csv'. Ensure the following files exist in the data folder:\n"
+        "- results.csv\n- qualifying.csv\n- races.csv\n- drivers.csv\n- constructors.csv\n- circuits.csv\n"
+        f"Looked in: {data_root}\nFound: {', '.join(csv_files)}"
+    )
 
 # Start with results as the base
 merged = dfs['results']
@@ -56,6 +73,8 @@ for name, df in dfs.items():
 merged.dropna(subset=['position_order', 'grid_position'], inplace=True)
 
 # --- FIND AND REPORT '\\N' VALUES (should be none after replacement, but this is a check) ---
+# Replace '\\N' with np.nan in all DataFrames before merging (apply here for merged safeguard too)
+merged = merged.replace('\\N', np.nan)
 mask = merged.apply(lambda col: col.astype(str).str.contains(r'\\N', na=False)).any()
 cols_with_N = merged.columns[mask]
 if len(cols_with_N) > 0:
@@ -76,7 +95,6 @@ def time_to_seconds(val):
     if ':' in val:
         parts = val.split(':')
         try:
-            # e.g. '1:42:11.687' or '1:23.456'
             parts = [float(p) for p in parts]
             if len(parts) == 3:
                 return parts[0]*3600 + parts[1]*60 + parts[2]
@@ -91,7 +109,6 @@ def time_to_seconds(val):
 
 # Detect columns that look like time/duration and convert them
 for col in merged.columns:
-    # Heuristic: if column is object and at least one value matches time pattern
     if merged[col].dtype == 'object':
         sample = merged[col].dropna().astype(str).head(10)
         if sample.str.contains(r'^\d+:\d+').any():
