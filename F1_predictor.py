@@ -72,17 +72,8 @@ for name, df in dfs.items():
 # Drop rows with missing target or key features
 merged.dropna(subset=['position_order', 'grid_position'], inplace=True)
 
-# --- FIND AND REPORT '\\N' VALUES (should be none after replacement, but this is a check) ---
-# Replace '\\N' with np.nan in all DataFrames before merging (apply here for merged safeguard too)
+# Replace '\\N' with np.nan (safeguard)
 merged = merged.replace('\\N', np.nan)
-mask = merged.apply(lambda col: col.astype(str).str.contains(r'\\N', na=False)).any()
-cols_with_N = merged.columns[mask]
-if len(cols_with_N) > 0:
-    rows_with_N = merged[cols_with_N][merged[cols_with_N].astype(str).apply(lambda x: x.str.contains(r'\\N', na=False)).any(axis=1)]
-    print("Rows containing '\\N':")
-    print(rows_with_N)
-else:
-    print("No '\\N' values found in merged DataFrame.")
 
 # --- CONVERT TIME/DURATION STRINGS TO SECONDS ---
 def time_to_seconds(val):
@@ -111,7 +102,7 @@ def time_to_seconds(val):
 for col in merged.columns:
     if merged[col].dtype == 'object':
         sample = merged[col].dropna().astype(str).head(10)
-        if sample.str.contains(r'^\d+:\d+').any():
+        if sample.str_contains(r'^\d+:\d+', regex=True).any() if hasattr(sample, "str_contains") else sample.str.contains(r'^\d+:\d+').any():
             merged[col] = merged[col].apply(time_to_seconds)
 
 # Feature engineering
@@ -130,9 +121,11 @@ merged = pd.get_dummies(merged, columns=categorical_cols, drop_first=True)
 
 # Remove leaky and ID columns
 leaky_cols = [
-    'position_order', 'top_10', 'raceId', 'driverId', 'constructorId', 'circuitId',
-    'date', 'dob', 'url', 'positions_gained', 'points', 'laps', 'fastestLapTime',
-    'resultId', 'qualifyId', 'statusId'
+    'top_10', 'raceId', 'driverId', 'constructorId', 'circuitId','position_order',
+    'date', 'dob', 'url', 'points', 'laps', 'fastestLapTime',
+    'resultId', 'qualifyId', 'statusId','fp1_time', 'fp2_time', 'fp3_time', 'q1_time', 'q2_time', 'q3_time',
+    'q1_position','q2_position','q3_position','q1','q2','q3','positions_gained','time','round','race_year','year'
+    ,'constructorId_qualifying','time_races','quali_time'
 ]
 
 feature_cols = [
@@ -151,34 +144,44 @@ if len(non_numeric_cols) > 0:
     print("Dropping non-numeric columns from features:", list(non_numeric_cols))
     X = X.drop(columns=non_numeric_cols)
 
-print(f"Final feature shape: {X.shape}")
-
-if X.shape[0] == 0:
-    raise ValueError("No samples left after cleaning. Please check your data and feature selection.")
-
-# Skipping features without any observed values: ['fp1_time' 'fp2_time' 'fp3_time' 'quali_time' 'sprint_time'].
+# Remove all-zero columns
 X = X.loc[:, (X != 0).any(axis=0)]
 
 # Drop columns that are all NaN
 X = X.dropna(axis=1, how='all')
-print(f"Feature shape after dropping all-NaN columns: {X.shape}")
+
+# NEW: Drop very sparse columns (e.g., <5% non-missing) to avoid imputer warnings and speed up
+min_non_null = max(1, int(np.ceil(0.05 * len(X))))
+before = X.shape[1]
+X = X.dropna(axis=1, thresh=min_non_null)
+# Drop constant columns
+const_cols = [c for c in X.columns if X[c].nunique(dropna=True) <= 1]
+if const_cols:
+    X = X.drop(columns=const_cols)
+print(f"Dropped {before - X.shape[1]} sparse/constant columns")
+
+print(f"Final feature shape: {X.shape}")
+if X.shape[0] == 0:
+    raise ValueError("No samples left after cleaning. Please check your data and feature selection.")
 
 # Train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-# Define both pipelines
+# Define both pipelines (faster RF, parallel where safe)
 pipelines = {
     "Logistic Regression": Pipeline([
-        ('imputer', SimpleImputer(strategy='mean')),
+        ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(max_iter=1000))
+        ('clf', LogisticRegression(max_iter=1000, n_jobs=None))
     ]),
     "Random Forest": Pipeline([
-        ('imputer', SimpleImputer(strategy='mean')),
-        ('scaler', StandardScaler()),  # Not strictly needed for RF, but keeps pipeline consistent
-        ('clf', RandomForestClassifier(n_estimators=100, random_state=42))
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),  # harmless for RF
+        ('clf', RandomForestClassifier(n_estimators=100, max_depth=12, n_jobs=-1, random_state=42))
     ])
 }
+
+cv_scores_by_model = {}
 
 for name, pipe in pipelines.items():
     print(f"\n=== {name} ===")
@@ -186,9 +189,13 @@ for name, pipe in pipelines.items():
     y_pred = pipe.predict(X_test)
     print("🏁 Classification Report:\n")
     print(classification_report(y_test, y_pred))
-    cv_scores = cross_val_score(pipe, X, y, cv=5, scoring='accuracy')
-    print(f"Cross-validation accuracy scores: {cv_scores}")
-    print(f"Mean CV accuracy: {cv_scores.mean():.3f}")
+
+    # Lighter and parallel CV
+    scores = cross_val_score(pipe, X, y, cv=3, scoring='accuracy', n_jobs=-1)
+    cv_scores_by_model[name] = scores
+    print(f"Cross-validation accuracy scores: {scores}")
+    print(f"Mean CV accuracy: {scores.mean():.3f}")
+
     if name == "Logistic Regression":
         coefs = pipe.named_steps['clf'].coef_[0]
         importances = pd.Series(coefs, index=X.columns).sort_values(ascending=False)
@@ -233,11 +240,8 @@ plt.xlabel("Absolute Coefficient")
 plt.gca().invert_yaxis()
 plt.show()
 
-# Cross-validation boxplot
-cv_results = []
-for name, pipe in pipelines.items():
-    scores = cross_val_score(pipe, X, y, cv=5, scoring='accuracy')
-    cv_results.append(pd.Series(scores, name=name))
+# Cross-validation boxplot (reuse computed scores to avoid extra work)
+cv_results = [pd.Series(scores, name=name) for name, scores in cv_scores_by_model.items()]
 pd.concat(cv_results, axis=1).boxplot()
 plt.title("Cross-Validation Accuracy Scores")
 plt.ylabel("Accuracy")
